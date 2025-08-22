@@ -116,6 +116,8 @@ if __name__ == "__main__":
 
     assert load_model_path is not None and num_evaluate_tasks == 1
 
+    # load_model_path=save_instruct_model_path = save_math_model_path = save_code_model_path = "export_for_vllm/llama2-13b-math-code-alignment-sparseft" 
+
     llm = LLM(model=load_model_path, tensor_parallel_size=args.tensor_parallel_size)
 
     if save_instruct_model_path is not None:

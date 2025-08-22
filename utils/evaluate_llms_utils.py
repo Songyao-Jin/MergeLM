@@ -18,34 +18,150 @@ def is_number(s):
         pass
     return False
 
+#--------------------------------- old function -----------------------------------------
+# def extract_answer_number(completion):
+#     text = completion.split('The answer is: ')
+#     if len(text) > 1:
+#         extract_ans = text[-1].strip()
+#         match = re.search(r'[\-+]?\d*[\.,/]?\d+', extract_ans)
+#         if match:
+#             if '/' in match.group():
+#                 denominator = match.group().split('/')[1]
+#                 numerator = match.group().split('/')[0]
+#                 if is_number(denominator) == True and is_number(numerator) == True:
+#                     if denominator == '0':
+#                         return round(float(numerator.replace(',', '')))
+#                     else:
+#                         frac = Fraction(match.group().replace(',', ''))
+#                         num_numerator = frac.numerator
+#                         num_denominator = frac.denominator
+#                         return round(float(num_numerator / num_denominator))
+#                 else:
+#                     return None
+#             else:
+#                 if float(match.group().replace(',', '')) == float('inf'):
+#                     return None
+#                 return round(float(match.group().replace(',', '')))
+#         else:
+#             return None
+#     else:
+#         return None
 
-def extract_answer_number(completion):
-    text = completion.split('The answer is: ')
-    if len(text) > 1:
-        extract_ans = text[-1].strip()
-        match = re.search(r'[\-+]?\d*[\.,/]?\d+', extract_ans)
-        if match:
-            if '/' in match.group():
-                denominator = match.group().split('/')[1]
-                numerator = match.group().split('/')[0]
-                if is_number(denominator) == True and is_number(numerator) == True:
-                    if denominator == '0':
-                        return round(float(numerator.replace(',', '')))
-                    else:
-                        frac = Fraction(match.group().replace(',', ''))
-                        num_numerator = frac.numerator
-                        num_denominator = frac.denominator
-                        return round(float(num_numerator / num_denominator))
-                else:
-                    return None
-            else:
-                if float(match.group().replace(',', '')) == float('inf'):
-                    return None
-                return round(float(match.group().replace(',', '')))
-        else:
-            return None
-    else:
+#-----------------------------------------------------------------------------------------
+
+
+#--------------------------------- new function -----------------------------------------
+import re
+from fractions import Fraction
+from typing import Optional, List, Tuple, Dict
+
+def _parse_number_str(num_str: str) -> Optional[int]:
+    s = num_str.strip().replace(",", "")
+    if s.lower() in {"inf", "+inf", "-inf", "infinity"}:
         return None
+    try:
+        if "/" in s:
+            val = float(Fraction(s))
+        else:
+            val = float(s)
+        return int(round(val))
+    except Exception:
+        return None
+
+def _pick_candidate(cands: List[Tuple[str, int]], policy: str, text_len: int, tail_window: int) -> Optional[int]:
+    """
+    cands: [(num_str, start_idx_in_text), ...]
+    policy: 'last' | 'first' | 'majority' | 'tail'
+    """
+    if not cands:
+        return None
+
+    if policy == "first":
+        num = _parse_number_str(cands[0][0])
+        return num
+
+    if policy == "majority":
+        counter: Dict[int, int] = {}
+        last_pos: Dict[int, int] = {}
+        for s, pos in cands:
+            n = _parse_number_str(s)
+            if n is None: 
+                continue
+            counter[n] = counter.get(n, 0) + 1
+            last_pos[n] = pos
+        if not counter:
+            return None
+        max_cnt = max(counter.values())
+        # 票数相同，取“出现位置更靠后的”
+        best_vals = [v for v,c in counter.items() if c == max_cnt]
+        best_vals.sort(key=lambda v: last_pos[v])
+        return best_vals[-1]
+
+    if policy == "tail":
+        # 优先在尾部窗口内找最后一次
+        cutoff = max(0, text_len - tail_window)
+        tail_cands = [(s, pos) for s, pos in cands if pos >= cutoff]
+        if tail_cands:
+            s, _ = tail_cands[-1]
+            return _parse_number_str(s)
+        # 否则退化为 'last'
+        s, _ = cands[-1]
+        return _parse_number_str(s)
+
+    # 默认 'last'
+    s, _ = cands[-1]
+    return _parse_number_str(s)
+
+def extract_answer_number(
+    text: str, 
+    policy: str = "majority",         # 'last' | 'first' | 'majority' | 'tail'
+    tail_window: int = 1000        # policy='tail' 时的尾部窗口大小
+) -> Optional[int]:
+    """
+    提取顺序（每步用 policy 选一条）：
+      1) '#### <number>'（默认取最后一次/按 policy）
+      2) '\boxed{<number>}'（可选，常见于 LaTeX）
+      3) '(the) answer is|final answer|answer' 后的数字
+      4) 文本尾部兜底（最后 1000 字符内的最后一个数字）
+    """
+    # 记录匹配到的 [字符串, 起始位置]，以便做策略选择
+    def find_all_with_pos(pat: re.Pattern, text: str) -> List[Tuple[str,int]]:
+        return [(m.group(1), m.start()) for m in pat.finditer(text)]
+
+    # 1) #### number
+    pat_hash = re.compile(r"#\s*#\s*#\s*#\s*([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)", re.IGNORECASE)
+    cands = find_all_with_pos(pat_hash, text)
+    n = _pick_candidate(cands, policy, len(text), tail_window)
+    if n is not None:
+        return n
+
+    # 2) \boxed{number} (可选，但很常见于数学答案)
+    pat_box = re.compile(r"\\boxed\{\s*([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)\s*\}")
+    cands = find_all_with_pos(pat_box, text)
+    n = _pick_candidate(cands, policy, len(text), tail_window)
+    if n is not None:
+        return n
+
+    # 3) "answer is / final answer / answer:"
+    pat_ans = re.compile(
+        r"(?:the\s+answer\s+is|final\s+answer|answer)[:\s]*([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)",
+        re.IGNORECASE,
+    )
+    cands = find_all_with_pos(pat_ans, text)
+    n = _pick_candidate(cands, policy, len(text), tail_window)
+    if n is not None:
+        return n
+
+    # 4) 兜底：看文本尾部，找最后一个数字
+    tail = text[-tail_window:]
+    m_all = re.findall(r"([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)", tail)
+    if m_all:
+        return _parse_number_str(m_all[-1])
+
+    return None
+
+
+#-----------------------------------------------------------------------------------------
 
 
 def batch_data(data_list, batch_size=1):

@@ -32,7 +32,13 @@ finetuned_model_backbone_mapping_dict = {
     "WizardCoder-Python-7B-V1.0": "CodeLlama-7b-Python-hf",
     "WizardCoder-Python-13B-V1.0": "CodeLlama-13b-Python-hf",
     "WizardCoder-Python-34B-V1.0": "CodeLlama-34b-Python-hf",
-    "llama-2-13b-code-alpaca": "Llama-2-13b-hf"
+    "llama-2-13b-code-alpaca": "Llama-2-13b-hf",
+    "llama-2-13b-math-code-wanda-merge_hf": "Llama-2-13b-hf",
+    "llama-2-13b-math-code-wanda-merge_version2_hf": "Llama-2-13b-hf",
+    "llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_0.5_hf": "Llama-2-13b-hf", 
+    "llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_1_hf": "Llama-2-13b-hf", 
+    "llama2-13b-math-code-alignment-sparseft": "Llama-2-13b-hf", 
+    "llama2-13b-math-code-alignment-denseft": "Llama-2-13b-hf", 
 }
 
 
@@ -81,11 +87,24 @@ def recover_from_pretrained_model(finetuned_model_name, pretrained_model_name, a
 
 def create_llm(finetuned_model_name, pretrained_model_name, args, logger: logging.Logger, tensor_parallel_size=1, just_inference=False, save_model_path=None):
     if just_inference:
-        if os.path.exists(os.path.join(cache_dir, finetuned_model_name)):
-            llm = LLM(model=os.path.join(cache_dir, finetuned_model_name), tensor_parallel_size=tensor_parallel_size)
+        if finetuned_model_name == "llama-2-13b-math-code-wanda-merge_hf":
+            llm = LLM(model="merged_models/llama-2-13b-math-code-wanda-merge_hf", tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
+        elif finetuned_model_name == "llama-2-13b-math-code-wanda-merge_version2_hf":
+            llm = LLM(model="merged_models/llama-2-13b-math-code-wanda-merge_version2_hf", tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
+        elif finetuned_model_name == "llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_0.5_hf":
+            llm = LLM(model="merged_models/llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_0.5_hf", tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
+        elif finetuned_model_name == "llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_1_hf":
+            llm = LLM(model="merged_models/llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_1_hf", tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
+        elif finetuned_model_name == "llama2-13b-math-code-alignment-sparseft":
+            llm = LLM(model="export_for_vllm/llama2-13b-math-code-alignment-sparseft" , tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
+        elif finetuned_model_name == "llama2-13b-math-code-alignment-denseft":
+            llm = LLM(model="export_for_vllm/llama2-13b-math-code-alignment-denseft" , tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
+        elif os.path.exists(os.path.join(cache_dir, finetuned_model_name)):
+            llm = LLM(model=os.path.join(cache_dir, finetuned_model_name), tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64)  #gpu_memory_utilization=0.6
+            # llm = LLM(model="merged_models/llama-2-13b-math-code-wanda-merge_hf", tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
         else:
             assert os.path.exists(finetuned_model_name)
-            llm = LLM(model=finetuned_model_name, tensor_parallel_size=tensor_parallel_size)
+            llm = LLM(model=finetuned_model_name, tensor_parallel_size=tensor_parallel_size, max_num_seqs=1)
         assert save_model_path is None
     else:
         try:
@@ -149,6 +168,7 @@ def create_llm(finetuned_model_name, pretrained_model_name, args, logger: loggin
 def test_alpaca_eval(llm, finetuned_model_name, args, logger: logging.Logger, start_index=0, end_index=sys.maxsize,
                      save_model_path=None, save_gen_results_folder=None):
     try:
+        # eval_set = datasets.load_dataset("tatsu-lab/alpaca_eval", name="alpaca_eval", cache_dir=cache_dir)["eval"]
         eval_set = datasets.load_dataset(path=os.path.join(cache_dir, "alpaca_eval"), name="alpaca_eval")["eval"]
     except:
         eval_set = datasets.load_dataset(path="tatsu-lab/alpaca_eval", name="alpaca_eval", cache_dir=cache_dir)["eval"]
@@ -235,6 +255,15 @@ def test_gsm8k(llm, test_data_path, args, logger: logging.Logger, start_index=0,
             prompt = [prompt]
         completions = llm.generate(prompt, sampling_params)
         for output in completions:
+            # print("==DEBUG==")
+            # print("output.outputs:", output.outputs)
+            # if output.outputs:
+            #     print("output.tokens:", getattr(output.outputs[0], 'token_ids', None))
+            #     print("output.text:", repr(output.outputs[0].text))
+            #     generated_text = output.outputs[0].text
+            # else:
+            #     generated_text = ""
+            
             generated_text = output.outputs[0].text
             res_completions.append(generated_text)
 
@@ -554,7 +583,10 @@ if __name__ == "__main__":
                         choices=["WizardLM-7B-V1.0", "WizardLM-13B-V1.2", "WizardLM-70B-V1.0",
                                  "WizardMath-7B-V1.0", "WizardMath-13B-V1.0", "WizardMath-70B-V1.0",
                                  "WizardCoder-Python-7B-V1.0", "WizardCoder-Python-13B-V1.0", "WizardCoder-Python-34B-V1.0",
-                                 "llama-2-13b-code-alpaca"])
+                                 "llama-2-13b-code-alpaca", 
+                                 "llama-2-13b-math-code-wanda-merge_hf", "llama-2-13b-math-code-wanda-merge_version2_hf", "llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_0.5_hf", "llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_1_hf",
+                                 "llama2-13b-math-code-alignment-sparseft",
+                                 "llama2-13b-math-code-alignment-denseft",])
     parser.add_argument("--dataset_name", type=str, default="alpaca_eval", help="dataset to be used", choices=["alpaca_eval", "gsm8k", "MATH", "human_eval", "mbpp"])
     parser.add_argument("--start_index", type=int, default=0)
     parser.add_argument("--end_index", type=int, default=sys.maxsize)

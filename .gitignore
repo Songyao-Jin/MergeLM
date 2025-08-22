@@ -119,3 +119,51 @@ save_merge_models/
 save_merge_results/
 save_gen_codes_results/
 save_gen_instruct_responses_results/
+
+
+
+
+
+
+# ---- OS / 编辑器 ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+
+# ---- 日志 / 输出 ----
+*.log
+logs/
+outputs/
+wandb/
+tmp/
+cache/
+
+# ---- 大模型文件（权重/检查点/导出等）----
+*.pt
+*.pth
+*.bin
+*.npz
+*.h5
+*.ckpt
+*.safetensors
+
+# ---- 忽略具体目录 (根据你的 find 结果) ----
+save_merge_models/
+merged_models/
+export_for_vllm/
+dense_merge_outputs/
+sparse_merge_outputs/
+dense_ft_ckpts/
+sparse_ft_ckpts/
+activations/
+masks/
