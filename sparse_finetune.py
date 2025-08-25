@@ -518,7 +518,7 @@ def main():
         task_mix={"math":1.0, "code":1.0, "general": 1.0},   # 做数学+代码+对齐
         math_sizes=(8000, 8000),             # GSM8K 8k + MATH 8k（可按显存调小）
         code_n=8000,                        # CodeAlpaca 子集
-        general_n=8000,  25steps
+        general_n=8000,         # 约 25 steps（示意）
         lr=1e-5, epochs=1, batch_size=1, grad_accum=16,
         wandb_proj="weight-sparse-ft", run_name="llama2-13b-sparseft",
         # 让 [0..4] 与 [35..39] 层全部参与训练：

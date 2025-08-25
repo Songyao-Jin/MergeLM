@@ -6,8 +6,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # src = "sparse_ft_ckpts/llama2-13b-math-code-alignment-sparseft"   # 你的训练输出目录
 # dst = "export_for_vllm/llama2-13b-math-code-alignment-sparseft"                  # 新导出目录
 
-src = "dense_ft_ckpts/llama2-13b-math-code-alignment-denseft"
-dst = "export_for_vllm/llama2-13b-math-code-alignment-denseft"
+# src = "dense_ft_ckpts/llama2-13b-math-code-alignment-denseft"
+# dst = "export_for_vllm/llama2-13b-math-code-alignment-denseft"
+
+# src = "sparse_ft_ckpts/llama2-13b-math-code-alignment-sparseft/epoch1_batch_size4_grad_accum16_step24_tok28k"   # 你的训练输出目录
+# dst = "export_for_vllm/llama2-13b-math-code-alignment-sparseft/epoch1_batch_size4_grad_accum16_step24_tok28k" 
+
+src = "sparse_ft_ckpts/llama2-13b-math-code-alignment-sparseft/epoch1_batch_size4_grad_accum16_step48_tok55k"   # 你的训练输出目录
+dst = "export_for_vllm/llama2-13b-math-code-alignment-sparseft/epoch1_batch_size4_grad_accum16_step48_tok55k" 
 
 
 os.makedirs(dst, exist_ok=True)

@@ -1,6 +1,6 @@
 {
   "mbpp": {
-    "pass@1": 0.296
+    "pass@1": 0.31
   },
   "config": {
     "prefix": "",
@@ -31,7 +31,7 @@
     "postprocess": true,
     "allow_code_execution": true,
     "generation_only": false,
-    "load_generations_path": "./save_gen_codes_results/mbpp/llama2-13b-math-code-alignment-denseft_inference_mask_0.0.jsonl",
+    "load_generations_path": "./save_gen_codes_results/mbpp/llama2-13b-math-code-alignment-sparseft_step48_inference_mask_0.0.jsonl",
     "load_data_path": null,
     "metric_output_path": "evaluation_results.json",
     "save_generations": false,

@@ -39,6 +39,8 @@ finetuned_model_backbone_mapping_dict = {
     "llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_1_hf": "Llama-2-13b-hf", 
     "llama2-13b-math-code-alignment-sparseft": "Llama-2-13b-hf", 
     "llama2-13b-math-code-alignment-denseft": "Llama-2-13b-hf", 
+    "llama2-13b-math-code-alignment-sparseft_step24": "Llama-2-13b-hf",
+    "llama2-13b-math-code-alignment-sparseft_step48": "Llama-2-13b-hf",
 }
 
 
@@ -99,6 +101,10 @@ def create_llm(finetuned_model_name, pretrained_model_name, args, logger: loggin
             llm = LLM(model="export_for_vllm/llama2-13b-math-code-alignment-sparseft" , tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
         elif finetuned_model_name == "llama2-13b-math-code-alignment-denseft":
             llm = LLM(model="export_for_vllm/llama2-13b-math-code-alignment-denseft" , tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
+        elif finetuned_model_name == "llama2-13b-math-code-alignment-sparseft_step24":
+            llm = LLM(model="export_for_vllm/llama2-13b-math-code-alignment-sparseft/epoch1_batch_size4_grad_accum16_step24_tok28k" , tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
+        elif finetuned_model_name == "llama2-13b-math-code-alignment-sparseft_step48":
+            llm = LLM(model="export_for_vllm/llama2-13b-math-code-alignment-sparseft/epoch1_batch_size4_grad_accum16_step48_tok55k" , tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
         elif os.path.exists(os.path.join(cache_dir, finetuned_model_name)):
             llm = LLM(model=os.path.join(cache_dir, finetuned_model_name), tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64)  #gpu_memory_utilization=0.6
             # llm = LLM(model="merged_models/llama-2-13b-math-code-wanda-merge_hf", tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.9, max_num_seqs=64) 
@@ -586,7 +592,9 @@ if __name__ == "__main__":
                                  "llama-2-13b-code-alpaca", 
                                  "llama-2-13b-math-code-wanda-merge_hf", "llama-2-13b-math-code-wanda-merge_version2_hf", "llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_0.5_hf", "llama-2-13b-math-code-wanda-merge_softmax_amplification_factor_2_alpha_norm_1_hf",
                                  "llama2-13b-math-code-alignment-sparseft",
-                                 "llama2-13b-math-code-alignment-denseft",])
+                                 "llama2-13b-math-code-alignment-denseft",
+                                 "llama2-13b-math-code-alignment-sparseft_step24",
+                                 "llama2-13b-math-code-alignment-sparseft_step48",])
     parser.add_argument("--dataset_name", type=str, default="alpaca_eval", help="dataset to be used", choices=["alpaca_eval", "gsm8k", "MATH", "human_eval", "mbpp"])
     parser.add_argument("--start_index", type=int, default=0)
     parser.add_argument("--end_index", type=int, default=sys.maxsize)
