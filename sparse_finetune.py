@@ -18,6 +18,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedul
 import wandb
 from torch.utils.data import ConcatDataset
 from tqdm import tqdm
+from torch.amp import autocast, GradScaler
 
 from record_activations import load_model_and_tokenizer
 from extract_key_weights import _sanitize
@@ -125,7 +126,6 @@ def promote_layers_in_mask(
 
     print(f"[promote_layers_in_mask] 覆盖/合并: {changed} 个参数，新增: {added} 个参数")
     return mask
-
 # ------------------------------------------------
 
 
@@ -136,25 +136,6 @@ def apply_delta_inplace(model: torch.nn.Module, delta: Dict[str, torch.Tensor]):
         for k, v in delta.items():
             if k in sd and sd[k].shape == v.shape:
                 sd[k].add_(v.to(sd[k].dtype).to(sd[k].device))
-
-# def register_grad_masks(model: torch.nn.Module, mask: Dict[str, torch.Tensor]):
-#     """为参与训练的参数注册梯度掩码；mask 张量需与 param.shape 相同（bool/float均可）"""
-#     for name, p in model.named_parameters():
-#         if not p.requires_grad:
-#             continue
-#         m = mask.get(name, None)
-#         if m is None:
-#             # 没有显式 mask 的参数：保持梯度为 0（等价于不训练）
-#             p.register_hook(lambda g: torch.zeros_like(g))
-#         else:
-#             m = m.to(dtype=p.dtype, device=p.device)
-#             p.register_hook(lambda g, m=m: g * m)
-            
-#             # def make_hook(m):
-#             #     def hook(g):
-#             #         return g * m
-#             #     return hook
-#             # p.register_hook(make_hook(m))
 
 
 def apply_grad_masks_step_(model: torch.nn.Module, mask: Dict[str, torch.Tensor]):
@@ -183,124 +164,314 @@ def apply_grad_masks_step_(model: torch.nn.Module, mask: Dict[str, torch.Tensor]
         # gm 会在本次循环结束后被释放，不常驻显存
 
 
+
+def _to_causal_lm_example(tokenizer, prompt: str, target: str, max_len: int):
+    """
+    拼接 prompt+target，构造 causal LM 训练所需的 input_ids / labels / attention_mask
+    - prompt 部分 label = -100（不计 loss）
+    - target 部分 label = token_id
+    - 若末尾无 EOS：在不过长时追加；已达上限时用 EOS 覆盖最后一个 token
+    """
+    text = prompt + target
+    
+    # 先整体 tokenize（可能已被截断至 max_len）
+    enc_all = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_len)
+    
+    # === 补/替换 EOS（检查）===
+    eos_id = tokenizer.eos_token_id
+    if eos_id is not None:
+        ids  = enc_all["input_ids"]        # [1, L]
+        mask = enc_all["attention_mask"]   # [1, L]
+        device, dtype = ids.device, ids.dtype
+        last_id = ids[0, -1].item()
+
+        if last_id != eos_id:
+            eos = torch.tensor([[eos_id]], device=device, dtype=dtype)
+            if ids.size(1) < max_len:
+                # 还没到上限：直接在末尾“追加” EOS，并把 mask 也同步追加 1
+                ids  = torch.cat([ids,  eos], dim=1)
+                mask = torch.cat([mask, torch.ones_like(eos)], dim=1)
+            else:
+                # 已经被截断到上限：用 EOS 覆盖最后一个 token（长度不变）
+                ids[0, -1] = eos_id
+                mask[0, -1] = 1   # 显式保证 attention_mask 对应位置有效
+
+            enc_all["input_ids"] = ids
+            enc_all["attention_mask"] = mask
+    
+    # 构造 labels：prompt 段置为 -100，只优化 target 段
+    input_ids = enc_all["input_ids"][0]
+    labels    = input_ids.clone()
+    enc_prompt = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_len)
+    labels[:enc_prompt["input_ids"].shape[1]] = -100  
+    
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": enc_all["attention_mask"][0],
+    }
+    
+
+
+
 # ---------------- 数据集封装（Math） ----------------
-class MathSFTDataset(Dataset):
-    def __init__(self, tokenizer, max_len=2048, gsm8k_n=None, math_n=None):
+class Gsm8kSFTDataset(Dataset):
+    """
+    openai/gsm8k (subset='main'), 监督格式：
+    prompt: "Below is an instruction that describes a task.\n"
+                "Write a response that appropriately completes the request.\n\n"
+                f"### Instruction:\n{question}\n\n"
+                "### Response:\nLet's think step by step:\n"
+    target: 带推导步骤的完整答案（末尾补 EOS）
+    """
+    def __init__(self, tokenizer, max_len=2048, n=None, subset="main"):
         self.tok = tokenizer
+        self.max_len = max_len
         self.samples = []
 
-        # GSM8K（train）
-        ds_gsm = load_dataset("openai/gsm8k", "main", split="train")  # Q & A（带步骤）
-        if gsm8k_n: ds_gsm = ds_gsm.select(range(min(gsm8k_n, len(ds_gsm))))
-        # ds_gsm = load_gsm8k_train(max_n=gsm8k_n, subset="main")
-        for ex in ds_gsm:
-            q = ex["question"].strip()
-            a = ex["answer"].strip()
-            prompt = f"Question: {q}\n\nAnswer (step-by-step):\n"
-            target = a
-            self.samples.append((prompt, target))
+        ds = load_dataset("openai/gsm8k", subset, split="train")
+        if n:
+            ds = ds.select(range(min(n, len(ds))))
 
-        # MATH（train）
-        ds_math = load_dataset("nlile/hendrycks-MATH-benchmark", split="train")
-        if math_n: ds_math = ds_math.select(range(min(math_n, len(ds_math))))
-        for ex in ds_math:
-            q = ex["problem"].strip()
-            sol = ex["solution"].strip()
-            prompt = f"Question: {q}\n\nAnswer (step-by-step):\n"
-            target = sol
+        for ex in ds:
+            question = (ex["question"] or "").strip()
+            raw = (ex["answer"] or "").strip()
+            solution, answer = raw.rsplit('####',1)
+            solution, answer = solution.strip(), answer.strip()
+            
+            # Prompt（不计损失）
+            prompt = (
+                "Below is an instruction that describes a task.\n"
+                "Write a response that appropriately completes the request.\n\n"
+                f"### Instruction:\n{question}\n\n"
+                "### Response:\nLet's think step by step:\n"
+            )
+            # Target（计损失）
+            target = f"{solution}\n\nThe answer is: {answer}"
+            
             self.samples.append((prompt, target))
 
         random.shuffle(self.samples)
-        self.max_len = max_len
 
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, i):
         prompt, target = self.samples[i]
-        # 只对 target 计 loss：prompt 部分 label = -100
-        text = prompt + target
-        enc_all = self.tok(text, return_tensors="pt", truncation=True, max_length=self.max_len)
-        enc_prompt = self.tok(prompt, return_tensors="pt", truncation=True, max_length=self.max_len)
-        input_ids = enc_all.input_ids[0]
-        labels = input_ids.clone()
-        labels[:enc_prompt.input_ids.shape[1]] = -100
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": enc_all.attention_mask[0]}
+        return _to_causal_lm_example(self.tok, prompt, target, self.max_len)
+
+
+class HendrycksMathSFTDataset(Dataset):
+    """
+    nlile/hendrycks-MATH-benchmark，监督格式与 GSM8K 保持一致
+    """
+    def __init__(self, tokenizer, max_len=2048, n=None):
+        self.tok = tokenizer
+        self.max_len = max_len
+        self.samples = []
+
+        ds = load_dataset("nlile/hendrycks-MATH-benchmark", split="train")
+        if n: 
+            ds = ds.select(range(min(n, len(ds))))
+
+        for ex in ds:
+            question = (ex["problem"] or "").strip()
+            solution = (ex["solution"] or "").strip()
+            answer = (ex["answer"] or "").strip()
+            
+            # Prompt（不计损失）
+            prompt = (
+                "Below is an instruction that describes a task.\n"
+                "Write a response that appropriately completes the request.\n\n"
+                f"### Instruction:\n{question}\n\n"
+                "### Response:\nLet's think step by step:\n"
+            )
+            # Target（计损失）
+            target = f"{solution}\n\nThe final answer is: {answer}"
+            
+            self.samples.append((prompt, target))
+
+        random.shuffle(self.samples)
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, i):
+        prompt, target = self.samples[i]
+        return _to_causal_lm_example(self.tok, prompt, target, self.max_len)
+
 
 
 # ---------------- 数据集封装（Code Alpaca） ----------------
 class CodeAlpacaDataset(Dataset):
+    """
+    theblackcat102/evol-codealpaca-v1 只有两个字段：
+    - instruction: 任务/问题文本（可能含乱码/代码段）
+    - output: 期望响应（常含代码块）
+    模板（SFT风格）：
+    Below is an instruction that describes a task. Write a response that appropriately completes the request.
+    ### Instruction:
+    Create a Python script for this problem:
+    {instruction}
+    ### Response:
+    {output}
+    """
     def __init__(self, tokenizer, max_len=2048, n=None):
         self.tok = tokenizer
-        ds = load_dataset("theblackcat102/evol-codealpaca-v1", split="train")
-        if n: ds = ds.select(range(min(n, len(ds))))
-        self.samples = []
-        for ex in ds:
-            instr = (ex.get("instruction") or "").strip()
-            inp   = (ex.get("input") or "").strip()
-            out   = (ex.get("output") or "").strip()
-            prompt = f"### Instruction:\n{instr}\n### Input:\n{inp}\n### Response:\n"
-            target = out
-            self.samples.append((prompt, target))
         self.max_len = max_len
+        self.samples = []
 
-    def __len__(self): return len(self.samples)
+        ds = load_dataset("theblackcat102/evol-codealpaca-v1", split="train")
+        if n:
+            ds = ds.select(range(min(n, len(ds))))
+
+        for ex in ds:
+            instruction = (ex.get("instruction") or "").strip()
+            output   = (ex.get("output") or "").strip()
+            if not instruction or not output:
+                continue  # 跳过无效样本
+
+            # Prompt（不计损失）
+            prompt = (
+                "Below is an instruction that describes a task.\n "
+                "Write a response that appropriately completes the request.\n\n"
+                "### Instruction:\n"
+                "Create a Python script for this problem:\n"
+                f"{instruction}\n\n"
+                "### Response:\n"
+            )
+
+            # Target（计损失）
+            target = output
+
+            self.samples.append((prompt, target))
+
+        random.shuffle(self.samples)
+
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, i):
         prompt, target = self.samples[i]
-        text = prompt + target
-        enc_all = self.tok(text, return_tensors="pt", truncation=True, max_length=self.max_len)
-        enc_prompt = self.tok(prompt, return_tensors="pt", truncation=True, max_length=self.max_len)
-        input_ids = enc_all.input_ids[0]
-        labels = input_ids.clone()
-        labels[:enc_prompt.input_ids.shape[1]] = -100
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": enc_all.attention_mask[0]}
+        # 统一用工具：补/替换 EOS，构造 labels（prompt 段置 -100）
+        return _to_causal_lm_example(self.tok, prompt, target, self.max_len)
 
 
 
 # ---------------- 数据集封装（Evol-Instruct V2） ----------------
 class EvolInstructV2Dataset(Dataset):
     """
-    默认加载 WizardLMTeam/WizardLM_evol_instruct_V2_196k
-    兼容字段名：instruction / input / output|response|answer
-    训练时只对 Response 段计 loss（Prompt 段 label = -100）
+    WizardLMTeam/WizardLM_evol_instruct_V2_196k
+    每条数据结构：
+      - idx: id
+      - conversations: [{"from": "human", "value": ...}, {"from": "gpt", "value": ...}]
+    只取单轮 human -> gpt 作为监督样本
+    Prompt 模板：
+      A chat between a curious user and an artificial intelligence assistant.
+      The assistant gives helpful, detailed, and polite answers to the user's questions.
+      USER: {instruction}
+      ASSISTANT:
     """
-    def __init__(self, tokenizer, dataset_name="WizardLMTeam/WizardLM_evol_instruct_V2_196k",
-                 split="train", max_len=2048, n=None):
+    def __init__(self, tokenizer, max_len=2048, n=None):
         self.tok = tokenizer
-        ds = load_dataset(dataset_name, split=split)
-        if n: ds = ds.select(range(min(n, len(ds))))
+        self.max_len = max_len
         self.samples = []
 
+        ds = load_dataset("WizardLMTeam/WizardLM_evol_instruct_V2_196k", split="train")
+        if n:
+            ds = ds.select(range(min(n, len(ds))))
+
         for ex in ds:
-            instr = (ex.get("instruction") or "").strip()
-            inp   = (ex.get("input") or "").strip()
-            # 不同版本字段名可能不同，做个兜底
-            out   = (ex.get("output") or ex.get("response") or ex.get("answer") or "").strip()
-
-            # Alpaca/WizardLM 常见格式
-            prompt = f"### Instruction:\n{instr}\n"
-            if len(inp) > 0:
-                prompt += f"### Input:\n{inp}\n"
-            prompt += "### Response:\n"
-
-            target = out
-            if target == "":   # 空样本跳过
+            conversations = ex.get("conversations", [])
+            # 过滤空/畸形
+            if not isinstance(conversations, list) or len(conversations) < 2:
                 continue
+            
+            if conversations[0]["from"] != "human" or conversations[1]["from"] != "gpt":
+                continue
+
+            instruction = conversations[0]["value"].strip()
+            response    = conversations[1]["value"].strip()
+            
+            prompt = (
+                "A chat between a curious user and an artificial intelligence assistant.\n"
+                "The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n"
+                f"### USER:\n {instruction}\n\n"
+                "### ASSISTANT:\n"
+            )
+            target = response
+            
             self.samples.append((prompt, target))
-
-        self.max_len = max_len
-
-    def __len__(self): return len(self.samples)
+            
+        random.shuffle(self.samples)
+            
+    
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, i):
         prompt, target = self.samples[i]
-        text = prompt + target
-        enc_all    = self.tok(text,   return_tensors="pt", truncation=True, max_length=self.max_len)
-        enc_prompt = self.tok(prompt, return_tensors="pt", truncation=True, max_length=self.max_len)
-        input_ids = enc_all.input_ids[0]
-        labels    = input_ids.clone()
-        labels[:enc_prompt.input_ids.shape[1]] = -100  # 只训练 response
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": enc_all.attention_mask[0]}
+        return _to_causal_lm_example(self.tok, prompt, target, self.max_len)
+
+
+
+# === Round-Robin（耗尽式）平衡采样数据集 ===
+class RoundRobinConcat(Dataset):
+    """
+    将多个子 Dataset 以“轮番直到耗尽”的顺序拼接：
+    - 初始打乱每个子数据集的索引（可复现，用 seed）
+    - 每一“轮”按 ds0, ds1, ..., dsN 依次各取 1 条
+    - 若某个子集已取完，则在后续轮次中跳过该子集
+    - 直到所有子集都取完为止
+    - per_dataset_take: 限制每个子集最多取多少条（None 表示取完该子集）
+    """
+    def __init__(self, datasets: List[Dataset], per_dataset_take: Optional[int] = None, seed: int = 42):
+        assert len(datasets) > 0, "need at least one dataset"
+        self.datasets = datasets
+        rng = random.Random(seed)
+
+        # 为每个子集生成一个打乱后的索引列表；必要时裁到 per_dataset_take
+        self._buckets: List[List[int]] = []
+        for d in datasets:
+            idxs = list(range(len(d)))
+            rng.shuffle(idxs)
+            if per_dataset_take is not None:
+                idxs = idxs[:min(per_dataset_take, len(idxs))]
+            self._buckets.append(idxs)
+
+        # 构建“耗尽式轮番”的全局访问顺序
+        order: List[Tuple[int, int]] = []
+        positions = [0] * len(self._buckets)  # 每个子集当前游标
+        num_finished = 0
+        finished = [False] * len(self._buckets)
+
+        while num_finished < len(self._buckets):
+            progressed_this_round = False
+            for j, bucket in enumerate(self._buckets):
+                if finished[j]:
+                    continue
+                if positions[j] < len(bucket):
+                    local_idx = bucket[positions[j]]
+                    positions[j] += 1
+                    order.append((j, local_idx))
+                    progressed_this_round = True
+                if positions[j] >= len(bucket) and not finished[j]:
+                    finished[j] = True
+                    num_finished += 1
+            # 理论上当所有 bucket 都空时才会退出；这里加保护避免死循环
+            if not progressed_this_round:
+                break
+
+        self.order = order  # [(ds_id, local_idx), ...]，直到把所有子集耗尽
+
+    def __len__(self):
+        return len(self.order)
+
+    def __getitem__(self, idx):
+        ds_id, local_idx = self.order[idx]
+        return self.datasets[ds_id][local_idx]
+
+
+
+
 
 
 def collate(batch, pad_id):
@@ -334,29 +505,30 @@ def sparse_finetune(
     dense_merged_delta_path: str = None,           # ← 平均后的 dense delta 路径
     # --- 其它原有参数 ---
     out_dir: str = "dummy",
-    task_mix: dict = {"math": 1.0, "code": 1.0, "general": 0.0},   # ← 新增 general
+    task_mix: dict = {"gsm8k":1.0, "math":1.0, "code":1.0, "general": 1.0},
     math_sizes=(8000, 8000),
     code_n=50000,
-    general_n=30000,                                               # ← 新增：EvolV2 采样数
-    # evol_ds_name="WizardLMTeam/WizardLM_evol_instruct_V2_196k",    # ← 新增：数据集名
+    general_n=30000,                                              
     lr=1e-5,
     epochs=1,
     batch_size=1,
     grad_accum=16,
-    # bf16=True,
     wandb_proj="sparse-ft",
     run_name="sparse_ft_run",
-    seed=42,
+    seed=0,
     # 可选：给全参/稀疏不同的 weight_decay
     wd_sparse: float = 0.0, wd_dense: float = 0.01,
     # ↓↓↓ 新增：想额外放开的层索引
     extra_train_layers: Optional[List[int]] = None,
     extra_patterns: Optional[List[str]] = None,  # 例如只放开 ["self_attn","mlp"]
+    # 模型训练提速的参数
+    use_amp: bool = True,        # ← 是否启用 AMP
+    
 ):
     set_random_seed(seed)
     # 1) 加载模型
     print("load")
-    model, tok = load_model_and_tokenizer(base_model_name_or_path, half_model_dtype=False, seed=seed, device="balanced_low_0")
+    model, tok = load_model_and_tokenizer(base_model_name_or_path, half_model_dtype=False, seed=seed, device="auto")
     print("load successfully")
     model.train()
     
@@ -385,28 +557,26 @@ def sparse_finetune(
             )
     
     
-    
-    
     # 4) 数据
-    datasets: List[Dataset] = []
+    ds_list: List[Dataset] = []
+    if task_mix.get("gsm8k", 0) > 0:
+        ds_list.append(Gsm8kSFTDataset(tok, max_len=1024, n=math_sizes[0]))
     if task_mix.get("math", 0) > 0:
-        ds_math = MathSFTDataset(tok, max_len=1024, gsm8k_n=math_sizes[0], math_n=math_sizes[1])
-        datasets.append(ds_math)
-
+        ds_list.append(HendrycksMathSFTDataset(tok, max_len=1024, n=math_sizes[1]))
     if task_mix.get("code", 0) > 0:
         ds_code = CodeAlpacaDataset(tok, max_len=1024, n=code_n)
-        datasets.append(ds_code)
-
-    # 新增：Evol-Instruct V2（通用指令）
+        ds_list.append(ds_code)
     if task_mix.get("general", 0) > 0:
         ds_gen = EvolInstructV2Dataset(tok, max_len=1024, n=general_n)
-        datasets.append(ds_gen)
+        ds_list.append(ds_gen)
         
     
-    # 简单拼接（需要更精细采样时可写 WeightedRandomSampler）
-    train_ds = ConcatDataset(datasets)
+    # 严格轮番
+    # 将多个子 Dataset 以“轮番直到耗尽”的顺序拼接
+    # DataLoader 不需要 shuffle（顺序已在数据集里确定）
+    train_ds = RoundRobinConcat(ds_list, per_dataset_take=None, seed=seed)
     loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
+        train_ds, batch_size=batch_size, shuffle=False,
         collate_fn=lambda b: collate(b, pad_id=tok.pad_token_id)
     )
     
@@ -416,11 +586,38 @@ def sparse_finetune(
         weight_decay = wd_dense
     else:
        weight_decay = wd_sparse
-    # opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+       
+    # try:
+    #     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, fused=True)
+    # except TypeError:
+    #     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     opt = bnb.optim.AdamW8bit(model.parameters(), lr=lr, weight_decay=weight_decay)
     steps_per_epoch = math.ceil(len(train_ds) / (batch_size * grad_accum))
     num_steps = steps_per_epoch * epochs
     sch = get_linear_schedule_with_warmup(opt, int(0.03 * num_steps), num_steps)
+    
+    # ===== AMP/Scaler =====
+    _amp_dtype = None
+    if torch.cuda.is_bf16_supported():
+        _amp_dtype = torch.bfloat16
+        print("Use torch.bfloat16 for fine tuning.")
+    else:
+        _amp_dtype = torch.float16
+        print("Use torch.float16 for fine tuning.")
+    scaler = GradScaler('cuda', enabled=(use_amp and torch.cuda.is_available() and _amp_dtype == torch.float16))    #AMP/Scaler
+    
+    # ====== Save plan & helper ======
+    # 保存计划：前 8 次每 128 step，后 4 次每 256 step
+    first_k, first_gap = 8, 128
+    second_k, second_gap = 4, 256
+    
+    
+    first_part  = [first_gap * i for i in range(1, first_k + 1)]
+    start_after = first_part[-1] if first_part else 0
+    second_part = [start_after + second_gap * i for i in range(1, second_k + 1)]
+
+    save_steps = set(first_part + second_part)   # 用 set 方便快速查
+    
     
     # 6) W&B
     if wandb_proj:
@@ -432,31 +629,68 @@ def sparse_finetune(
         })
         
     # 7) 训练
-    global_step = 0
+    update_step = 0
     for epoch in range(epochs):
         running = 0.0
         for i, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch+1}")):
-            out = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
-            loss = out.loss / grad_accum
-            loss.backward()
+            with autocast("cuda", enabled=use_amp, dtype=_amp_dtype):
+                out = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                    )
+                loss = out.loss / grad_accum
+            
+            
+            # 反传：fp16 用 scaler.scale。bf16/关闭AMP，则普通 backward
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
             running += loss.item()
             
             if (i + 1) % grad_accum == 0:
                 if train_all_weights == False:
-                    # 在 step 前做一次“步前梯度掩码”，避免 mask 常驻 GPU
+                    # 在 step 前做一次“步前梯度掩码”，避免 mask 常驻 GPU. (注意在 unscale 前也可以，因为只是逐元素乘)
                     apply_grad_masks_step_(model, merged_mask)  # 稀疏才需要
                 
+                # 如果用了 scaler，需要先 unscale 再做 clip
+                if scaler.is_enabled():
+                    scaler.unscale_(opt)
+                
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+                
+                # 优化器步进
+                if scaler.is_enabled():
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
+                
                 opt.zero_grad()
                 sch.step()
-                global_step += 1
-                if wandb_proj and global_step % 10 == 0:
-                    wandb.log({"loss": running, "lr": sch.get_last_lr()[0], "step": global_step})
+                
+                update_step += 1
+                
+                # 触发：在计划中的 step 才保存
+                if update_step in save_steps:
+                    ckpt_dir = os.path.join(out_dir, f"epoch{epoch}_batchSize{batch_size}_gradAccum{grad_accum}_ckpt-step{update_step}")
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    model.save_pretrained(ckpt_dir)
+                    tok.save_pretrained(ckpt_dir)
+                    with open(os.path.join(ckpt_dir, "meta.json"), "w") as f:
+                        json.dump({
+                            "epoch": epoch,
+                            "update_step": update_step,
+                            "batch_size": batch_size,
+                            "grad_accum": grad_accum,
+                            "lr": lr
+                        }, f, ensure_ascii=False, indent=2)
+                    print(f"[CKPT] Saved checkpoint at step {update_step} -> {ckpt_dir}")
+                
+                if wandb_proj and update_step % 10 == 0:
+                    wandb.log({"loss": running, "lr": sch.get_last_lr()[0], "step": update_step})
                 running = 0.0
 
         print(f"Epoch {epoch+1} done.")    
@@ -474,19 +708,20 @@ def sparse_finetune(
 
 def main():
     
-    # # sparse finetune
-    # sparse_finetune(
-    #     base_model_name_or_path="Llama-2-13b-hf",
-    #     merged_sparse_delta_path="sparse_merge_outputs/Llama-2-13b-hf_f53da205/merged_sparse_delta_union_avg_top10.pt",
-    #     merged_mask_path="sparse_merge_outputs/Llama-2-13b-hf_f53da205/merged_mask_union_top10.pt",
-    #     out_dir="sparse_ft_ckpts/llama2-13b-math-code-alignment-sparseft",
-    #     task_mix={"math":1.0, "code":1.0, "general": 1.0},   # 做数学+代码+对齐
-    #     math_sizes=(8000, 8000),             # GSM8K 8k + MATH 8k（可按显存调小）
-    #     code_n=8000,                        # CodeAlpaca 子集
-    #     general_n=8000,
-    #     lr=1e-5, epochs=1, batch_size=1, grad_accum=16,
-    #     wandb_proj="weight-sparse-ft", run_name="llama2-13b-sparseft"
-    #     )
+    # sparse finetune
+    sparse_finetune(
+        base_model_name_or_path="Llama-2-13b-hf",
+        merged_sparse_delta_path="sparse_merge_outputs/Llama-2-13b-hf_f53da205/merged_sparse_delta_union_avg_top10.pt",
+        merged_mask_path="sparse_merge_outputs/Llama-2-13b-hf_f53da205/merged_mask_union_top10.pt",
+        out_dir="sparse_ft_ckpts/llama2-13b-math-code-alignment-sparseft",
+        task_mix={"gsm8k":1.0, "math":1.0, "code":1.0, "general": 1.0},   # 做数学+代码+对齐
+        math_sizes=(8000, 8000),             # GSM8K 8k + MATH 8k（可按显存调小）
+        code_n=8000,                        # CodeAlpaca 子集
+        general_n=8000,
+        lr=1e-5, epochs=1, batch_size=1, grad_accum=16,
+        wandb_proj="weight-sparse-ft", run_name="llama2-13b-sparseft",
+        use_amp = True, 
+        )
     
     # # densely all weights finetune
     # build_dense_avg_delta(
@@ -509,23 +744,23 @@ def main():
     # )
     
     
-    # sparse finetune with extra_train_layers
-    sparse_finetune(
-        base_model_name_or_path="Llama-2-13b-hf",
-        merged_sparse_delta_path="sparse_merge_outputs/Llama-2-13b-hf_f53da205/merged_sparse_delta_union_avg_top10.pt",
-        merged_mask_path="sparse_merge_outputs/Llama-2-13b-hf_f53da205/merged_mask_union_top10.pt",
-        out_dir="sparse_ft_ckpts/llama2-13b-math-code-alignment-estra_train_layers_[0,1,2,3,4,35,36,37,38,39]-sparseft",
-        task_mix={"math":1.0, "code":1.0, "general": 1.0},   # 做数学+代码+对齐
-        math_sizes=(8000, 8000),             # GSM8K 8k + MATH 8k（可按显存调小）
-        code_n=8000,                        # CodeAlpaca 子集
-        general_n=8000,         # 约 25 steps（示意）
-        lr=1e-5, epochs=1, batch_size=1, grad_accum=16,
-        wandb_proj="weight-sparse-ft", run_name="llama2-13b-sparseft",
-        # 让 [0..4] 与 [35..39] 层全部参与训练：
-        extra_train_layers=[0,1,2,3,4,35,36,37,38,39],
-        # 如果只想放开注意力和 MLP，不动层归一化/嵌入：
-        # extra_patterns=["self_attn","mlp"],
-        )
+    # # sparse finetune with extra_train_layers
+    # sparse_finetune(
+    #     base_model_name_or_path="Llama-2-13b-hf",
+    #     merged_sparse_delta_path="sparse_merge_outputs/Llama-2-13b-hf_f53da205/merged_sparse_delta_union_avg_top10.pt",
+    #     merged_mask_path="sparse_merge_outputs/Llama-2-13b-hf_f53da205/merged_mask_union_top10.pt",
+    #     out_dir="sparse_ft_ckpts/llama2-13b-math-code-alignment-estra_train_layers_[0,1,2,3,4,35,36,37,38,39]-sparseft",
+    #     task_mix={"math":1.0, "code":1.0, "general": 1.0},   # 做数学+代码+对齐
+    #     math_sizes=(8000, 8000),             # GSM8K 8k + MATH 8k（可按显存调小）
+    #     code_n=8000,                        # CodeAlpaca 子集
+    #     general_n=8000,         # 约 25 steps（示意）
+    #     lr=1e-5, epochs=1, batch_size=1, grad_accum=16,
+    #     wandb_proj="weight-sparse-ft", run_name="llama2-13b-sparseft",
+    #     # 让 [0..4] 与 [35..39] 层全部参与训练：
+    #     extra_train_layers=[0,1,2,3,4,35,36,37,38,39],
+    #     # 如果只想放开注意力和 MLP，不动层归一化/嵌入：
+    #     # extra_patterns=["self_attn","mlp"],
+    #     )
     
     
 if __name__ == "__main__":

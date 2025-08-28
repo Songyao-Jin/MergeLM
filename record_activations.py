@@ -37,7 +37,7 @@ def load_model_and_tokenizer(model_name, half_model_dtype=False, seed=0, device 
         model_path = model_name
         
     max_mem = {i: "15GiB" for i in range(torch.cuda.device_count())}  # 给每卡留 ~1GiB 余量
-    model = AutoModelForCausalLM.from_pretrained(model_path, cache_dir=cache_dir, device_map=device, max_memory=max_mem)
+    model = AutoModelForCausalLM.from_pretrained(model_path, cache_dir=cache_dir, device_map=device, max_memory=max_mem, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=cache_dir, use_fast=False)
     model.eval()
     
@@ -51,7 +51,7 @@ def load_model_and_tokenizer(model_name, half_model_dtype=False, seed=0, device 
     
     # 3. 设置随机种子（可选）
     # set random seed to guarantee reproducibility
-    set_random_seed(seed=0)
+    set_random_seed(seed)
     
     
     # 4. 处理 pad_token

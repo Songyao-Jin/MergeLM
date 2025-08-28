@@ -18,7 +18,7 @@ def is_number(s):
         pass
     return False
 
-#--------------------------------- old function -----------------------------------------
+# # --------------------------------- old function -----------------------------------------
 # def extract_answer_number(completion):
 #     text = completion.split('The answer is: ')
 #     if len(text) > 1:
@@ -47,104 +47,137 @@ def is_number(s):
 #     else:
 #         return None
 
-#-----------------------------------------------------------------------------------------
+# # -----------------------------------------------------------------------------------------
 
 
 #--------------------------------- new function -----------------------------------------
 import re
+import string
 from fractions import Fraction
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Union
 
-def _parse_number_str(num_str: str) -> Optional[int]:
-    s = num_str.strip().replace(",", "")
+Number = Union[int, float]          # 返回类型：可能是 int，也可能是 float
+_EPS = 1e-9                         # 判断“是否是整数”的容差
+
+def _coerce_int_if_clean(val: float) -> Number:
+    """若 val 非常接近整数，则返回 int；否则返回原 float。"""
+    # round(val) 得到最接近的整数；若差值在极小容差内，就当作“干净整数”
+    iv = round(val)
+    return int(iv) if abs(val - iv) <= _EPS else val
+
+def _parse_number_str(num_str: str) -> Optional[Number]:
+    """将字符串解析为数字：
+       - 支持 1,234.56、-3.5、7/2 等
+       - 去掉末尾标点（解决句号/逗号黏在数字后面）
+       - 返回 int 或 float（整数干净则 int）"""
+    s = num_str.strip()                     # 去掉首尾空白
+    s = s.replace(",", "")                  # 去掉千位分隔逗号
+    s = s.replace("−", "-")                 # 统一全角/数学减号为普通减号
+    s = s.rstrip(string.punctuation).strip()# 去掉末尾标点，再次去空白
+
+    # 排除无穷等无效数字
     if s.lower() in {"inf", "+inf", "-inf", "infinity"}:
         return None
-    try:
-        if "/" in s:
-            val = float(Fraction(s))
-        else:
-            val = float(s)
-        return int(round(val))
-    except Exception:
-        return None
 
-def _pick_candidate(cands: List[Tuple[str, int]], policy: str, text_len: int, tail_window: int) -> Optional[int]:
-    """
-    cands: [(num_str, start_idx_in_text), ...]
-    policy: 'last' | 'first' | 'majority' | 'tail'
-    """
+    try:
+        # 支持分数，如 "7/2"
+        if "/" in s:
+            val = float(Fraction(s))        # Fraction 更稳健，能处理“3/10”
+        else:
+            val = float(s)                  # 其余按浮点解析
+        return _coerce_int_if_clean(val)    # 整数干净就转 int，否则保留 float
+    except Exception:
+        return None                         # 解析失败返回 None   
+
+
+
+def _pick_candidate(
+    cands: List[Tuple[str, int]],
+    policy: str,
+    text_len: int,
+    tail_window: int
+) -> Optional[Number]:
+    """在若干候选 (字符串数字, 起始位置) 中按策略挑一个：
+       - policy: 'last' | 'first' | 'majority' | 'tail'"""
     if not cands:
         return None
 
     if policy == "first":
-        num = _parse_number_str(cands[0][0])
-        return num
+        # 取第一个匹配到的候选
+        return _parse_number_str(cands[0][0])
 
     if policy == "majority":
-        counter: Dict[int, int] = {}
-        last_pos: Dict[int, int] = {}
+        # 统计哪一个数值出现次数最多，平票时取“出现位置更靠后的”
+        counter: Dict[Number, int] = {}
+        last_pos: Dict[Number, int] = {}
         for s, pos in cands:
             n = _parse_number_str(s)
-            if n is None: 
+            if n is None:
                 continue
             counter[n] = counter.get(n, 0) + 1
             last_pos[n] = pos
         if not counter:
             return None
         max_cnt = max(counter.values())
-        # 票数相同，取“出现位置更靠后的”
-        best_vals = [v for v,c in counter.items() if c == max_cnt]
+        best_vals = [v for v, c in counter.items() if c == max_cnt]
         best_vals.sort(key=lambda v: last_pos[v])
         return best_vals[-1]
 
     if policy == "tail":
-        # 优先在尾部窗口内找最后一次
+        # 优先在文本尾部窗口（tail_window 字符内）里选最后一次出现
         cutoff = max(0, text_len - tail_window)
         tail_cands = [(s, pos) for s, pos in cands if pos >= cutoff]
         if tail_cands:
-            s, _ = tail_cands[-1]
-            return _parse_number_str(s)
+            return _parse_number_str(tail_cands[-1][0])
         # 否则退化为 'last'
-        s, _ = cands[-1]
-        return _parse_number_str(s)
+        return _parse_number_str(cands[-1][0])
 
-    # 默认 'last'
-    s, _ = cands[-1]
-    return _parse_number_str(s)
+    # 默认策略：取最后一次出现
+    return _parse_number_str(cands[-1][0])
 
 def extract_answer_number(
-    text: str, 
-    policy: str = "majority",         # 'last' | 'first' | 'majority' | 'tail'
-    tail_window: int = 1000        # policy='tail' 时的尾部窗口大小
-) -> Optional[int]:
+    text: str,
+    policy: str = "majority",   # 'last' | 'first' | 'majority' | 'tail'
+    tail_window: int = 1000     # policy='tail' 时的尾部窗口大小
+) -> Optional[Number]:
     """
-    提取顺序（每步用 policy 选一条）：
-      1) '#### <number>'（默认取最后一次/按 policy）
-      2) '\boxed{<number>}'（可选，常见于 LaTeX）
-      3) '(the) answer is|final answer|answer' 后的数字
-      4) 文本尾部兜底（最后 1000 字符内的最后一个数字）
+    依次尝试以下模式（每步用 policy 选一条）：
+      1) '#### <number>'
+      2) '\\boxed{<number>}'（LaTeX 常见）
+      3) '(the) answer is|final answer|final answer is|the final answer is' 后的数字
+      4) 兜底：在文本尾部窗口内寻找最后一个数字
+    匹配到数字后：
+      - 若是“干净整数”，返回 int
+      - 否则返回 float（保留小数）
     """
-    # 记录匹配到的 [字符串, 起始位置]，以便做策略选择
-    def find_all_with_pos(pat: re.Pattern, text: str) -> List[Tuple[str,int]]:
-        return [(m.group(1), m.start()) for m in pat.finditer(text)]
+    # 小工具：返回 [(匹配到的“数字字符串”, 起始位置), ...]
+    def find_all_with_pos(pat: re.Pattern, txt: str) -> List[Tuple[str, int]]:
+        return [(m.group(1), m.start()) for m in pat.finditer(txt)]
 
     # 1) #### number
-    pat_hash = re.compile(r"#\s*#\s*#\s*#\s*([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)", re.IGNORECASE)
+    pat_hash = re.compile(
+        r"#\s*#\s*#\s*#\s*([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)",
+        re.IGNORECASE
+    )
     cands = find_all_with_pos(pat_hash, text)
     n = _pick_candidate(cands, policy, len(text), tail_window)
     if n is not None:
         return n
 
-    # 2) \boxed{number} (可选，但很常见于数学答案)
-    pat_box = re.compile(r"\\boxed\{\s*([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)\s*\}")
+    # 2) \boxed{number}
+    pat_box = re.compile(
+        r"\\boxed\{\s*([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)\s*\}"
+    )
     cands = find_all_with_pos(pat_box, text)
     n = _pick_candidate(cands, policy, len(text), tail_window)
     if n is not None:
         return n
 
-    # 3) "answer is / final answer / answer:"
+    # 3) "answer" 系列：包含
+    #    "the answer is", "final answer", "final answer is", "the final answer is", 以及简单 "answer"
     pat_ans = re.compile(
-        r"(?:the\s+answer\s+is|final\s+answer|answer)[:\s]*([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)",
+        r"(?:the\s+final\s+answer\s+is|final\s+answer\s+is|the\s+answer\s+is|final\s+answer|answer)"
+        r"[:\s]*([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)",
         re.IGNORECASE,
     )
     cands = find_all_with_pos(pat_ans, text)
@@ -152,7 +185,7 @@ def extract_answer_number(
     if n is not None:
         return n
 
-    # 4) 兜底：看文本尾部，找最后一个数字
+    # 4) 兜底：看文本尾部，找最后一个数字（支持整数/小数/分数）
     tail = text[-tail_window:]
     m_all = re.findall(r"([-+]?\d+(?:[.,]\d+)?(?:/\d+)?)", tail)
     if m_all:
@@ -187,26 +220,96 @@ def remove_boxed(s):
     except:
         return None
 
+# # --------------------------------- old function -----------------------------------------
+# def process_results(doc, completion, answer, invalid_outputs):
+#     split_ans = completion.split('The answer is: ')
+#     if len(split_ans) > 1:
+#         ans = split_ans[-1]
+#         extract_ans_temp = ans.split('.\n')[0]
+#         extract_ans_temp = extract_ans_temp.strip()
+#         if len(extract_ans_temp) > 0 and extract_ans_temp[-1] == '.':
+#             extract_ans = extract_ans_temp[0:-1]
+#         else:
+#             extract_ans = extract_ans_temp
+#         extract_ans = extract_ans.strip()
+#         if is_equiv(extract_ans, answer):
+#             return True
+#         else:
+#             return False
+#     else:
+#         temp = {'question': doc, 'output': completion, 'answer': answer}
+#         invalid_outputs.append(temp)
+#         return False
+# # -----------------------------------------------------------------------------------------
+
+
+# --------------------------------- new function -----------------------------------------
+def _clean_answer_text(s: str) -> str:
+    """清理答案字符串：去末尾标点/空白，去 LaTeX 包裹。"""
+    s = s.strip()
+    # 去掉最外层 \boxed{...} / $...$
+    m = re.fullmatch(r"\\boxed\{(.+)\}", s)
+    if m:
+        s = m.group(1).strip()
+    if s.startswith("$") and s.endswith("$"):
+        s = s[1:-1].strip()
+    # 去掉末尾标点（句号、逗号等）
+    s = s.rstrip(string.punctuation + "，。；；…")
+    return s.strip()
+
+def extract_final_answer_text(text: str) -> str | None:
+    """
+    从文本中提取“最终答案”字符串：
+      - 依次尝试以下模式的“最后一次出现”：
+        1) #### <ans>
+        2) \boxed{<ans>}
+        3) (the) answer is / final answer / final answer is / the final answer is
+    """
+    # 1) #### <ans>
+    m = None
+    for m in re.finditer(r"#\s*#\s*#\s*#\s*(.+)", text, flags=re.IGNORECASE):
+        pass
+    if m:
+        return _clean_answer_text(m.group(1))
+
+    # 2) \boxed{<ans>}
+    for m in re.finditer(r"\\boxed\{\s*(.+?)\s*\}", text):
+        pass
+    if m:
+        return _clean_answer_text(m.group(1))
+
+    # 3) answer 提示词（取最后一次）
+    pat = re.compile(
+        r"(?:the\s+final\s+answer\s+is|final\s+answer\s+is|the\s+answer\s+is|final\s+answer|answer)"
+        r"[:\s]*([^\n\r]+)",
+        flags=re.IGNORECASE,
+    )
+    for m in pat.finditer(text):
+        pass
+    if m:
+        return _clean_answer_text(m.group(1))
+
+    return None
 
 def process_results(doc, completion, answer, invalid_outputs):
-    split_ans = completion.split('The answer is: ')
-    if len(split_ans) > 1:
-        ans = split_ans[-1]
-        extract_ans_temp = ans.split('.\n')[0]
-        extract_ans_temp = extract_ans_temp.strip()
-        if len(extract_ans_temp) > 0 and extract_ans_temp[-1] == '.':
-            extract_ans = extract_ans_temp[0:-1]
-        else:
-            extract_ans = extract_ans_temp
-        extract_ans = extract_ans.strip()
-        if is_equiv(extract_ans, answer):
-            return True
-        else:
-            return False
-    else:
-        temp = {'question': doc, 'output': completion, 'answer': answer}
-        invalid_outputs.append(temp)
+    # 提取模型给出的“最终答案文本”
+    pred = extract_final_answer_text(completion)
+    if pred is None:
+        invalid_outputs.append({'question': doc, 'output': completion, 'answer': answer})
         return False
+
+    # 规范化一下两边（去空格、大小写）
+    pred_norm = _clean_answer_text(pred).replace(" ", "").lower()
+    gold_norm = _clean_answer_text(answer).replace(" ", "").lower()
+
+    # 如果你有更强的等价判断（比如符号化比较），在 is_equiv 里实现即可
+    if is_equiv(pred_norm, gold_norm):
+        return True
+    else:
+        # 这条样例里 pred = "h+c/2" 与 gold = "2k" 不等价，应判错
+        return False
+# -----------------------------------------------------------------------------------------
+
 
 
 def last_boxed_only_string(string):
@@ -390,6 +493,12 @@ def is_equiv(str1, str2, verbose=False):
         return ss1 == ss2
     except Exception:
         return str1 == str2
+
+
+
+
+
+
 
 
 def generate_instruction_following_task_prompt(instruction, is_chat_model=True):
